@@ -67,9 +67,12 @@ git clone git@github.com:username/claude-config.git ~/.claude-sync
 
 # 2. 运行安装脚本（配置仓库中自带）
 bash ~/.claude-sync/install.sh
+
+# 3. 在 Claude Code 中安装缺失依赖（MCP 服务器、插件等）
+/sync deps install
 ```
 
-安装脚本会自动检测到已有配置仓库，将远程配置同步到本地 `~/.claude/`。
+安装脚本会自动检测到已有配置仓库，将远程配置同步到本地 `~/.claude/`，并检查依赖环境。
 
 > **注意**: 第二台机器克隆的是你的**配置仓库**（`claude-config`），不是这个项目仓库（`claude-config-sync`）。
 
@@ -98,6 +101,13 @@ bash ~/.claude-sync/install.sh
 ```
 /sync init         初始化本地同步仓库
 /sync remote <url> 设置远程仓库地址
+```
+
+### 依赖管理
+
+```
+/sync deps         检查依赖环境（系统工具、MCP、插件）
+/sync deps install 自动安装缺失依赖
 ```
 
 ### 冲突处理
@@ -146,6 +156,21 @@ bash ~/.claude-sync/install.sh
 - **位置**: 安装后位于 `~/.claude-sync/`
 
 简单来说：**项目仓库是工具，配置仓库是数据**。你只需要安装一次项目仓库，之后所有同步操作都通过配置仓库进行。
+
+### 依赖管理
+
+同步工具不仅复制配置文件，还能自动检测和安装配置所依赖的运行时环境：
+
+| 类型 | 示例 | 检测方式 | 安装方式 |
+|------|------|----------|----------|
+| 系统工具 | node, bun, python3 | `command -v` | `brew install` |
+| MCP 服务器 | @brave/brave-search-mcp-server | 解析 mcp.json | `npx -y` 自动安装 |
+| 插件 | claude-hud | 解析 installed_plugins.json | `claude plugin add` |
+| 自定义 | 任意 | postinstall.sh | 用户自定义脚本 |
+
+运行 `/sync deps` 检查环境，`/sync deps install` 一键安装所有缺失项。
+
+你也可以在 `~/.claude-sync/postinstall.sh` 中添加自定义安装步骤（如额外的 brew 包、pip 包等），该脚本会在 `/sync deps install` 时自动执行。
 
 ## 安全提醒
 

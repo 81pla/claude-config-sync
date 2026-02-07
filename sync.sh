@@ -37,6 +37,12 @@ RSYNC_EXCLUDES=(
   "--exclude=node_modules"
 )
 
+# 插件元数据（只同步清单，不同步插件本体）
+PLUGIN_META_FILES=(
+  "plugins/known_marketplaces.json"
+  "plugins/installed_plugins.json"
+)
+
 # ---- 工具函数 ----
 log_info()  { echo -e "${BLUE}[信息]${NC} $*"; }
 log_ok()    { echo -e "${GREEN}[完成]${NC} $*"; }
@@ -83,6 +89,16 @@ copy_local_to_repo() {
       cp "$src" "$dst"
     fi
   done
+
+  # 插件元数据
+  for file in "${PLUGIN_META_FILES[@]}"; do
+    local src="$CLAUDE_DIR/$file"
+    local dst="$SYNC_DIR/$file"
+    if [ -f "$src" ]; then
+      mkdir -p "$(dirname "$dst")"
+      cp "$src" "$dst"
+    fi
+  done
 }
 
 # 将同步仓库的配置复制回 ~/.claude/
@@ -97,6 +113,16 @@ copy_repo_to_local() {
       mkdir -p "$dst"
       rsync -a "${RSYNC_EXCLUDES[@]}" "$src/" "$dst/"
     else
+      cp "$src" "$dst"
+    fi
+  done
+
+  # 插件元数据
+  for file in "${PLUGIN_META_FILES[@]}"; do
+    local src="$SYNC_DIR/$file"
+    local dst="$CLAUDE_DIR/$file"
+    if [ -f "$src" ]; then
+      mkdir -p "$(dirname "$dst")"
       cp "$src" "$dst"
     fi
   done
@@ -469,6 +495,253 @@ cmd_log() {
   git log --oneline --graph --decorate -20
 }
 
+# ================================================================
+# 依赖检测与安装
+# ================================================================
+
+# 从 mcp.json 和 settings.json 提取 npx 包名
+extract_mcp_packages() {
+  python3 -c "
+import json, os
+seen = set()
+for f in ['$CLAUDE_DIR/mcp.json', '$CLAUDE_DIR/settings.json']:
+    if not os.path.isfile(f): continue
+    try:
+        with open(f) as fh:
+            data = json.load(fh)
+        servers = data.get('mcpServers', {})
+        for name, cfg in servers.items():
+            cmd = cfg.get('command', '')
+            if cmd == 'npx':
+                args = cfg.get('args', [])
+                for a in args:
+                    if not a.startswith('-'):
+                        if a not in seen:
+                            seen.add(a)
+                            print(a)
+                        break
+    except: pass
+" 2>/dev/null
+}
+
+# 从 known_marketplaces.json 提取插件信息
+extract_plugins() {
+  local meta="$CLAUDE_DIR/plugins/known_marketplaces.json"
+  [ ! -f "$meta" ] && return
+  python3 -c "
+import json
+try:
+    with open('$meta') as f:
+        data = json.load(f)
+    for name, info in data.items():
+        repo = info.get('source', {}).get('repo', '')
+        if repo:
+            print(f'{name}|{repo}')
+except: pass
+" 2>/dev/null
+}
+
+cmd_deps() {
+  local mode="${1:-check}"   # check | install
+  local missing=0
+  local ok_count=0
+
+  echo ""
+  echo -e "${BOLD}══════════════════════════════════════${NC}"
+  echo -e "${BOLD}  依赖环境检查${NC}"
+  echo -e "  机器: ${CYAN}$MACHINE_ID${NC}"
+  echo -e "${BOLD}══════════════════════════════════════${NC}"
+  echo ""
+
+  # ---- 1. 系统工具 ----
+  echo -e "${BOLD}── 系统工具 ──${NC}"
+
+  local tools_to_install=()
+
+  check_tool() {
+    local tool="$1"
+    local install_hint="$2"
+    if command -v "$tool" &>/dev/null; then
+      local ver
+      ver=$("$tool" --version 2>/dev/null | head -1)
+      echo -e "  ${GREEN}✓${NC} $tool  ($ver)"
+      ok_count=$((ok_count + 1))
+    else
+      echo -e "  ${RED}✗${NC} $tool  — 安装: $install_hint"
+      tools_to_install+=("$tool")
+      missing=$((missing + 1))
+    fi
+  }
+
+  check_tool node "brew install node"
+  check_tool npx  "brew install node"
+  check_tool git  "xcode-select --install"
+  check_tool python3 "xcode-select --install"
+  check_tool rsync "brew install rsync"
+
+  # bun（可能在 ~/.bun/bin/ 下）
+  if command -v bun &>/dev/null; then
+    local ver
+    ver=$(bun --version 2>/dev/null)
+    echo -e "  ${GREEN}✓${NC} bun  ($ver)"
+    ok_count=$((ok_count + 1))
+  elif [ -x "$HOME/.bun/bin/bun" ]; then
+    local ver
+    ver=$("$HOME/.bun/bin/bun" --version 2>/dev/null)
+    echo -e "  ${GREEN}✓${NC} bun  ($ver) [~/.bun/bin/bun]"
+    ok_count=$((ok_count + 1))
+  else
+    echo -e "  ${RED}✗${NC} bun  — 安装: curl -fsSL https://bun.sh/install | bash"
+    tools_to_install+=("bun")
+    missing=$((missing + 1))
+  fi
+
+  # claude CLI
+  if command -v claude &>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} claude CLI"
+    ok_count=$((ok_count + 1))
+  else
+    echo -e "  ${RED}✗${NC} claude CLI  — 安装: npm install -g @anthropic-ai/claude-code"
+    tools_to_install+=("claude")
+    missing=$((missing + 1))
+  fi
+
+  # ---- 2. MCP 服务器 ----
+  echo ""
+  echo -e "${BOLD}── MCP 服务器 ──${NC}"
+
+  local mcp_packages=()
+  while IFS= read -r pkg; do
+    [ -n "$pkg" ] && mcp_packages+=("$pkg")
+  done < <(extract_mcp_packages)
+
+  if [ ${#mcp_packages[@]} -eq 0 ]; then
+    echo "  (无 MCP 依赖)"
+  else
+    for pkg in "${mcp_packages[@]}"; do
+      # 检查 npm 全局缓存或 npx 缓存
+      if npm list -g "$pkg" &>/dev/null 2>&1 || \
+         [ -d "$HOME/.npm/_npx" ] && find "$HOME/.npm/_npx" -path "*/$pkg" -type d 2>/dev/null | grep -q .; then
+        echo -e "  ${GREEN}✓${NC} $pkg"
+        ((ok_count++)) || true
+      else
+        echo -e "  ${YELLOW}○${NC} $pkg  (npx -y 首次使用时自动安装)"
+      fi
+    done
+  fi
+
+  # ---- 3. 插件 ----
+  echo ""
+  echo -e "${BOLD}── 插件 ──${NC}"
+
+  local plugins_to_install=()
+  local has_plugins=false
+
+  while IFS='|' read -r name repo; do
+    [ -z "$name" ] && continue
+    has_plugins=true
+    if [ -d "$CLAUDE_DIR/plugins/cache/$name" ]; then
+      echo -e "  ${GREEN}✓${NC} $name  (from $repo)"
+      ((ok_count++)) || true
+    else
+      echo -e "  ${RED}✗${NC} $name  — 安装: claude plugin add $repo"
+      plugins_to_install+=("$name|$repo")
+      ((missing++)) || true
+    fi
+  done < <(extract_plugins)
+
+  $has_plugins || echo "  (无插件)"
+
+  # ---- 4. 自定义依赖 ----
+  if [ -f "$SYNC_DIR/postinstall.sh" ]; then
+    echo ""
+    echo -e "${BOLD}── 自定义脚本 ──${NC}"
+    echo "  postinstall.sh 存在"
+  fi
+
+  # ---- 汇总 ----
+  echo ""
+  echo "────────────────────────────────────"
+  if [ "$missing" -gt 0 ]; then
+    echo -e "  ${GREEN}$ok_count 项就绪${NC} / ${RED}$missing 项缺失${NC}"
+    if [ "$mode" = "check" ]; then
+      echo ""
+      echo -e "  运行 ${BOLD}/sync deps install${NC} 自动安装缺失项"
+    fi
+  else
+    echo -e "  ${GREEN}全部 $ok_count 项就绪！${NC}"
+  fi
+  echo ""
+
+  # ---- 自动安装模式 ----
+  if [ "$mode" = "install" ] && [ "$missing" -gt 0 ]; then
+    echo -e "${BOLD}开始安装缺失依赖...${NC}"
+    echo ""
+
+    # 系统工具
+    for tool in "${tools_to_install[@]}"; do
+      case "$tool" in
+        node|npx)
+          log_step "安装 Node.js..."
+          if command -v brew &>/dev/null; then
+            brew install node 2>&1 | tail -3
+            log_ok "Node.js 已安装"
+          else
+            log_warn "未找到 Homebrew，请手动安装: brew install node"
+          fi
+          ;;
+        bun)
+          log_step "安装 Bun..."
+          curl -fsSL https://bun.sh/install | bash 2>&1 | tail -3
+          log_ok "Bun 已安装"
+          ;;
+        claude)
+          log_step "安装 Claude CLI..."
+          if command -v npm &>/dev/null; then
+            npm install -g @anthropic-ai/claude-code 2>&1 | tail -3
+            log_ok "Claude CLI 已安装"
+          else
+            log_warn "需要先安装 Node.js"
+          fi
+          ;;
+        git|python3|rsync)
+          log_step "安装 $tool..."
+          if command -v brew &>/dev/null; then
+            brew install "$tool" 2>&1 | tail -3
+            log_ok "$tool 已安装"
+          else
+            log_warn "请手动安装 $tool"
+          fi
+          ;;
+      esac
+    done
+
+    # 插件
+    for entry in "${plugins_to_install[@]}"; do
+      local name="${entry%%|*}"
+      local repo="${entry#*|}"
+      log_step "安装插件 $name..."
+      if command -v claude &>/dev/null; then
+        claude plugin add "$repo" 2>&1 | tail -5
+        log_ok "插件 $name 已安装"
+      else
+        log_warn "Claude CLI 不可用，请手动安装: claude plugin add $repo"
+      fi
+    done
+
+    # 自定义脚本
+    if [ -f "$SYNC_DIR/postinstall.sh" ]; then
+      log_step "运行自定义安装脚本..."
+      bash "$SYNC_DIR/postinstall.sh"
+      log_ok "自定义脚本执行完成"
+    fi
+
+    echo ""
+    log_ok "依赖安装完成！"
+    echo ""
+  fi
+}
+
 cmd_help() {
   cat << 'EOF'
 
@@ -491,13 +764,18 @@ cmd_help() {
     /sync diff              具体文件差异
     /sync log               同步历史记录
 
+  依赖管理:
+    /sync deps              检查依赖环境
+    /sync deps install      自动安装缺失依赖
+
   冲突处理:
     /sync resolve           解决冲突后完成同步
 
   ──────────────────────────────────────
   同步范围:
     CLAUDE.md, settings.json, mcp.json,
-    keybindings.json, agents/, skills/
+    keybindings.json, agents/, skills/,
+    plugins 元数据 (清单，非插件本体)
 
   不同步 (机器特有):
     settings.local.json, history, cache,
@@ -519,6 +797,7 @@ case "${1:-help}" in
   diff)    cmd_diff ;;
   log)     cmd_log ;;
   resolve) cmd_resolve ;;
+  deps)    cmd_deps "${2:-check}" ;;
   help|-h|--help) cmd_help ;;
   *)
     log_err "未知命令: $1"

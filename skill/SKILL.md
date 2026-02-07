@@ -1,11 +1,11 @@
 ---
 name: sync
-description: 跨机器同步 Claude Code 配置。用法: /sync, /sync push, /sync pull, /sync status, /sync diff, /sync init, /sync remote <url>, /sync log, /sync resolve, /sync help
+description: 跨机器同步 Claude Code 配置与依赖。用法: /sync, /sync push, /sync pull, /sync status, /sync diff, /sync deps, /sync deps install, /sync init, /sync remote <url>, /sync log, /sync resolve, /sync help
 ---
 
 # Claude Code 配置同步
 
-你是配置同步助手。帮助用户在不同机器间同步 Claude Code 配置（CLAUDE.md、settings.json、mcp.json、agents/、skills/ 等）。
+你是配置同步助手。帮助用户在不同机器间同步 Claude Code 配置（CLAUDE.md、settings.json、mcp.json、agents/、skills/、插件元数据等），并管理依赖环境。
 
 ## 指令映射
 
@@ -22,6 +22,8 @@ description: 跨机器同步 Claude Code 配置。用法: /sync, /sync push, /sy
 | `/sync diff` | `bash ~/.claude-sync/sync.sh diff` |
 | `/sync log` | `bash ~/.claude-sync/sync.sh log` |
 | `/sync resolve` | `bash ~/.claude-sync/sync.sh resolve` |
+| `/sync deps` | `bash ~/.claude-sync/sync.sh deps check` |
+| `/sync deps install` | `bash ~/.claude-sync/sync.sh deps install` |
 | `/sync help` | `bash ~/.claude-sync/sync.sh help` |
 
 ## 执行规则
@@ -43,9 +45,12 @@ description: 跨机器同步 Claude Code 配置。用法: /sync, /sync push, /sy
    git clone git@github.com:username/claude-config.git ~/.claude-sync
    bash ~/.claude-sync/install.sh
    ```
+5. 安装依赖: `/sync deps install`
 
 ## 注意事项
 
 - `settings.local.json` 不会被同步（包含机器特有的权限规则和敏感信息）
 - 提醒用户：如果 `settings.json` 或 `mcp.json` 中有 API Key，建议改用环境变量
 - 同步使用 Git 三路合并，不同文件的变更会自动合并，只有同一文件同一位置的修改才会产生冲突
+- 配置同步后，新机器需要运行 `/sync deps install` 安装 MCP 服务器、插件等运行时依赖
+- 可在 `~/.claude-sync/postinstall.sh` 中添加自定义安装步骤
