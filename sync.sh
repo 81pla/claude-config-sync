@@ -393,7 +393,32 @@ cmd_sync() {
   copy_repo_to_local
 
   echo ""
-  log_ok "同步完成！"
+  log_ok "配置同步完成！"
+
+  # 自动检查依赖是否齐全
+  echo ""
+  log_step "检查依赖环境..."
+  local dep_report
+  dep_report=$(scan_all_deps 2>/dev/null || true)
+  if [ -n "$dep_report" ]; then
+    local dep_missing
+    dep_missing=$(python3 -c "
+import json, sys
+r = json.loads(sys.argv[1])
+m = 0
+for c in r['commands']:
+    if not c['exists']: m += 1
+for p in r['plugins']:
+    if not p['installed']: m += 1
+print(m)
+" "$dep_report" 2>/dev/null || echo "0")
+
+    if [ "$dep_missing" -gt 0 ]; then
+      log_warn "发现 $dep_missing 个缺失依赖，运行 /sync deps 查看详情"
+    else
+      log_ok "所有依赖就绪"
+    fi
+  fi
   echo ""
 }
 
@@ -454,6 +479,27 @@ cmd_pull() {
 
   copy_repo_to_local
   log_ok "配置已更新到 ~/.claude/"
+
+  # 拉取后自动检查依赖
+  local dep_report
+  dep_report=$(scan_all_deps 2>/dev/null || true)
+  if [ -n "$dep_report" ]; then
+    local dep_missing
+    dep_missing=$(python3 -c "
+import json, sys
+r = json.loads(sys.argv[1])
+m = 0
+for c in r['commands']:
+    if not c['exists']: m += 1
+for p in r['plugins']:
+    if not p['installed']: m += 1
+print(m)
+" "$dep_report" 2>/dev/null || echo "0")
+
+    if [ "$dep_missing" -gt 0 ]; then
+      log_warn "发现 $dep_missing 个缺失依赖，运行 /sync deps install 安装"
+    fi
+  fi
 }
 
 cmd_resolve() {
