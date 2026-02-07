@@ -566,12 +566,16 @@ seen_cmds = set()
 
 def check_cmd(cmd):
     """检查命令是否存在，返回 (exists, path, version)"""
-    # 检查常见非 PATH 位置
+    # 检查常见非 PATH 位置（SSH 非交互模式下 PATH 可能不完整）
     extra_paths = [
         os.path.expanduser(f"~/.bun/bin/{cmd}"),
         os.path.expanduser(f"~/.deno/bin/{cmd}"),
         os.path.expanduser(f"~/.cargo/bin/{cmd}"),
         os.path.expanduser(f"~/.local/bin/{cmd}"),
+        os.path.expanduser(f"~/.npm-global/bin/{cmd}"),
+        f"/usr/local/bin/{cmd}",
+        f"/opt/homebrew/bin/{cmd}",
+        f"/opt/homebrew/sbin/{cmd}",
     ]
     path = shutil.which(cmd)
     if not path:
