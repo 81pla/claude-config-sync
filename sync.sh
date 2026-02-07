@@ -496,249 +496,366 @@ cmd_log() {
 }
 
 # ================================================================
-# 依赖检测与安装
+# 依赖检测（全动态 — 从配置文件自动提取，无硬编码清单）
 # ================================================================
 
-# 从 mcp.json 和 settings.json 提取 npx 包名
-extract_mcp_packages() {
-  python3 -c "
-import json, os
-seen = set()
-for f in ['$CLAUDE_DIR/mcp.json', '$CLAUDE_DIR/settings.json']:
-    if not os.path.isfile(f): continue
-    try:
-        with open(f) as fh:
-            data = json.load(fh)
-        servers = data.get('mcpServers', {})
-        for name, cfg in servers.items():
-            cmd = cfg.get('command', '')
-            if cmd == 'npx':
-                args = cfg.get('args', [])
-                for a in args:
-                    if not a.startswith('-'):
-                        if a not in seen:
-                            seen.add(a)
-                            print(a)
-                        break
-    except: pass
-" 2>/dev/null
+# 全量扫描所有配置，输出 JSON 诊断报告
+# 脚本只负责「发现事实」，不硬编码安装方法
+scan_all_deps() {
+  python3 - "$CLAUDE_DIR" "$SYNC_DIR" << 'PYTHON_SCAN'
+import json, os, sys, subprocess, shutil, glob
+
+claude_dir = sys.argv[1]
+sync_dir   = sys.argv[2]
+
+report = {
+    "commands": [],   # 配置中引用的所有外部命令
+    "mcp_servers": [],
+    "plugins": [],
+    "skill_deps": [],
+    "postinstall": os.path.isfile(os.path.join(sync_dir, "postinstall.sh")),
 }
 
-# 从 known_marketplaces.json 提取插件信息
-extract_plugins() {
-  local meta="$CLAUDE_DIR/plugins/known_marketplaces.json"
-  [ ! -f "$meta" ] && return
-  python3 -c "
-import json
-try:
-    with open('$meta') as f:
-        data = json.load(f)
-    for name, info in data.items():
-        repo = info.get('source', {}).get('repo', '')
-        if repo:
-            print(f'{name}|{repo}')
-except: pass
-" 2>/dev/null
+seen_cmds = set()
+
+def check_cmd(cmd):
+    """检查命令是否存在，返回 (exists, path, version)"""
+    # 检查常见非 PATH 位置
+    extra_paths = [
+        os.path.expanduser(f"~/.bun/bin/{cmd}"),
+        os.path.expanduser(f"~/.deno/bin/{cmd}"),
+        os.path.expanduser(f"~/.cargo/bin/{cmd}"),
+        os.path.expanduser(f"~/.local/bin/{cmd}"),
+    ]
+    path = shutil.which(cmd)
+    if not path:
+        for p in extra_paths:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                path = p
+                break
+    version = ""
+    if path:
+        try:
+            r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+            version = (r.stdout or r.stderr).strip().split("\n")[0]
+        except:
+            version = "installed"
+    return bool(path), path or "", version
+
+def register_cmd(cmd, source):
+    """注册一个被配置引用的命令"""
+    if cmd in seen_cmds:
+        return
+    seen_cmds.add(cmd)
+    exists, path, version = check_cmd(cmd)
+    report["commands"].append({
+        "name": cmd,
+        "exists": exists,
+        "path": path,
+        "version": version,
+        "source": source,
+    })
+
+# ---- 1. 扫描 MCP 服务器 (mcp.json + settings.json) ----
+for fname in ["mcp.json", "settings.json"]:
+    fpath = os.path.join(claude_dir, fname)
+    if not os.path.isfile(fpath):
+        continue
+    try:
+        with open(fpath) as f:
+            data = json.load(f)
+        servers = data.get("mcpServers", {})
+        for srv_name, cfg in servers.items():
+            cmd = cfg.get("command", "")
+            args = cfg.get("args", [])
+            if not cmd:
+                continue
+
+            # 注册命令本身
+            register_cmd(cmd, f"MCP:{srv_name}")
+
+            # 提取包名
+            package = ""
+            for a in args:
+                if not a.startswith("-"):
+                    package = a
+                    break
+
+            # 判断包管理器类型
+            pkg_type = "unknown"
+            if cmd == "npx":
+                pkg_type = "npm"
+            elif cmd == "uvx":
+                pkg_type = "pypi"
+            elif cmd in ("bunx", "bun"):
+                pkg_type = "npm"
+            elif cmd == "deno":
+                pkg_type = "deno"
+            elif cmd in ("python", "python3"):
+                pkg_type = "python_script"
+
+            report["mcp_servers"].append({
+                "name": srv_name,
+                "command": cmd,
+                "package": package,
+                "pkg_type": pkg_type,
+                "args": args,
+            })
+    except:
+        pass
+
+# ---- 2. 扫描 statusLine ----
+settings_path = os.path.join(claude_dir, "settings.json")
+if os.path.isfile(settings_path):
+    try:
+        with open(settings_path) as f:
+            data = json.load(f)
+        sl = data.get("statusLine", {})
+        if sl.get("type") == "command":
+            sl_cmd = sl.get("command", "")
+            # 提取 statusLine 中引用的命令
+            if sl_cmd:
+                # 解析 bash -c '...' 模式中引用的二进制
+                for token in sl_cmd.replace('"', " ").replace("'", " ").split():
+                    if "/" in token and os.path.basename(token):
+                        bin_name = os.path.basename(token)
+                        register_cmd(bin_name, "statusLine")
+                        break
+    except:
+        pass
+
+# ---- 3. 扫描插件 ----
+meta_path = os.path.join(claude_dir, "plugins", "known_marketplaces.json")
+if os.path.isfile(meta_path):
+    try:
+        with open(meta_path) as f:
+            data = json.load(f)
+        for name, info in data.items():
+            repo = info.get("source", {}).get("repo", "")
+            cache_dir = os.path.join(claude_dir, "plugins", "cache", name)
+            report["plugins"].append({
+                "name": name,
+                "repo": repo,
+                "installed": os.path.isdir(cache_dir),
+            })
+    except:
+        pass
+
+# ---- 4. 扫描 Skills 依赖文件 ----
+skills_dir = os.path.join(claude_dir, "skills")
+if os.path.isdir(skills_dir):
+    for skill in os.listdir(skills_dir):
+        skill_path = os.path.join(skills_dir, skill)
+        if not os.path.isdir(skill_path):
+            continue
+        # requirements.txt
+        req = os.path.join(skill_path, "requirements.txt")
+        if not os.path.isfile(req):
+            req = os.path.join(skill_path, "scripts", "requirements.txt")
+        if os.path.isfile(req):
+            report["skill_deps"].append({
+                "skill": skill,
+                "type": "pip",
+                "file": req,
+            })
+        # package.json
+        pkg = os.path.join(skill_path, "package.json")
+        if os.path.isfile(pkg):
+            report["skill_deps"].append({
+                "skill": skill,
+                "type": "npm",
+                "file": pkg,
+            })
+
+# ---- 5. sync 工具自身的基础依赖 ----
+for cmd in ["git", "rsync"]:
+    register_cmd(cmd, "sync-tool")
+
+print(json.dumps(report, ensure_ascii=False))
+PYTHON_SCAN
 }
 
 cmd_deps() {
-  local mode="${1:-check}"   # check | install
-  local missing=0
-  local ok_count=0
+  local mode="${1:-check}"
 
   echo ""
   echo -e "${BOLD}══════════════════════════════════════${NC}"
-  echo -e "${BOLD}  依赖环境检查${NC}"
+  echo -e "${BOLD}  依赖环境检查（动态扫描）${NC}"
   echo -e "  机器: ${CYAN}$MACHINE_ID${NC}"
   echo -e "${BOLD}══════════════════════════════════════${NC}"
   echo ""
 
-  # ---- 1. 系统工具 ----
-  echo -e "${BOLD}── 系统工具 ──${NC}"
+  # 执行全量扫描
+  local report
+  report=$(scan_all_deps)
 
-  local tools_to_install=()
-
-  check_tool() {
-    local tool="$1"
-    local install_hint="$2"
-    if command -v "$tool" &>/dev/null; then
-      local ver
-      ver=$("$tool" --version 2>/dev/null | head -1)
-      echo -e "  ${GREEN}✓${NC} $tool  ($ver)"
-      ok_count=$((ok_count + 1))
-    else
-      echo -e "  ${RED}✗${NC} $tool  — 安装: $install_hint"
-      tools_to_install+=("$tool")
-      missing=$((missing + 1))
-    fi
-  }
-
-  check_tool node "brew install node"
-  check_tool npx  "brew install node"
-  check_tool git  "xcode-select --install"
-  check_tool python3 "xcode-select --install"
-  check_tool rsync "brew install rsync"
-
-  # bun（可能在 ~/.bun/bin/ 下）
-  if command -v bun &>/dev/null; then
-    local ver
-    ver=$(bun --version 2>/dev/null)
-    echo -e "  ${GREEN}✓${NC} bun  ($ver)"
-    ok_count=$((ok_count + 1))
-  elif [ -x "$HOME/.bun/bin/bun" ]; then
-    local ver
-    ver=$("$HOME/.bun/bin/bun" --version 2>/dev/null)
-    echo -e "  ${GREEN}✓${NC} bun  ($ver) [~/.bun/bin/bun]"
-    ok_count=$((ok_count + 1))
-  else
-    echo -e "  ${RED}✗${NC} bun  — 安装: curl -fsSL https://bun.sh/install | bash"
-    tools_to_install+=("bun")
-    missing=$((missing + 1))
+  if [ -z "$report" ]; then
+    log_err "扫描失败（需要 python3）"
+    return 1
   fi
 
-  # claude CLI
-  if command -v claude &>/dev/null; then
-    echo -e "  ${GREEN}✓${NC} claude CLI"
-    ok_count=$((ok_count + 1))
-  else
-    echo -e "  ${RED}✗${NC} claude CLI  — 安装: npm install -g @anthropic-ai/claude-code"
-    tools_to_install+=("claude")
-    missing=$((missing + 1))
-  fi
+  # 用 python 渲染报告 + 生成安装脚本
+  python3 - "$report" "$mode" "$SYNC_DIR" "$CLAUDE_DIR" << 'PYTHON_RENDER'
+import json, sys, os
 
-  # ---- 2. MCP 服务器 ----
-  echo ""
-  echo -e "${BOLD}── MCP 服务器 ──${NC}"
+report = json.loads(sys.argv[1])
+mode   = sys.argv[2]
+sync_dir = sys.argv[3]
+claude_dir = sys.argv[4]
 
-  local mcp_packages=()
-  while IFS= read -r pkg; do
-    [ -n "$pkg" ] && mcp_packages+=("$pkg")
-  done < <(extract_mcp_packages)
+# ANSI colors
+R = "\033[0;31m"
+G = "\033[0;32m"
+Y = "\033[1;33m"
+B = "\033[0;34m"
+C = "\033[0;36m"
+BOLD = "\033[1m"
+NC = "\033[0m"
 
-  if [ ${#mcp_packages[@]} -eq 0 ]; then
-    echo "  (无 MCP 依赖)"
-  else
-    for pkg in "${mcp_packages[@]}"; do
-      # 检查 npm 全局缓存或 npx 缓存
-      if npm list -g "$pkg" &>/dev/null 2>&1 || \
-         [ -d "$HOME/.npm/_npx" ] && find "$HOME/.npm/_npx" -path "*/$pkg" -type d 2>/dev/null | grep -q .; then
-        echo -e "  ${GREEN}✓${NC} $pkg"
-        ((ok_count++)) || true
-      else
-        echo -e "  ${YELLOW}○${NC} $pkg  (npx -y 首次使用时自动安装)"
-      fi
-    done
-  fi
+missing = []
+ok = 0
 
-  # ---- 3. 插件 ----
-  echo ""
-  echo -e "${BOLD}── 插件 ──${NC}"
+# ---- 1. 被引用的命令 ----
+print(f"{BOLD}── 配置引用的命令 ──{NC}")
+for cmd in report["commands"]:
+    if cmd["exists"]:
+        ver = cmd["version"][:60] if cmd["version"] else ""
+        loc = ""
+        if cmd["path"] and "/." in cmd["path"]:
+            loc = f" [{cmd['path']}]"
+        print(f"  {G}✓{NC} {cmd['name']}  ({ver}){loc}  ← {cmd['source']}")
+        ok += 1
+    else:
+        print(f"  {R}✗{NC} {cmd['name']}  ← 被 {cmd['source']} 引用")
+        missing.append({"type": "command", "name": cmd["name"], "source": cmd["source"]})
 
-  local plugins_to_install=()
-  local has_plugins=false
+# ---- 2. MCP 服务器 ----
+print(f"\n{BOLD}── MCP 服务器 ──{NC}")
+if not report["mcp_servers"]:
+    print("  (无)")
+else:
+    for srv in report["mcp_servers"]:
+        cmd_ok = any(c["name"] == srv["command"] and c["exists"] for c in report["commands"])
+        pkg = srv["package"]
+        if cmd_ok:
+            if srv["pkg_type"] in ("npm", "pypi"):
+                print(f"  {G}✓{NC} {srv['name']}  ({srv['command']} → {pkg})")
+            else:
+                print(f"  {G}✓{NC} {srv['name']}  ({srv['command']})")
+            ok += 1
+        else:
+            print(f"  {R}✗{NC} {srv['name']}  (需要 {srv['command']})")
+            missing.append({
+                "type": "mcp",
+                "name": srv["name"],
+                "command": srv["command"],
+                "package": pkg,
+                "pkg_type": srv["pkg_type"],
+            })
 
-  while IFS='|' read -r name repo; do
-    [ -z "$name" ] && continue
-    has_plugins=true
-    if [ -d "$CLAUDE_DIR/plugins/cache/$name" ]; then
-      echo -e "  ${GREEN}✓${NC} $name  (from $repo)"
-      ((ok_count++)) || true
-    else
-      echo -e "  ${RED}✗${NC} $name  — 安装: claude plugin add $repo"
-      plugins_to_install+=("$name|$repo")
-      ((missing++)) || true
-    fi
-  done < <(extract_plugins)
+# ---- 3. 插件 ----
+print(f"\n{BOLD}── 插件 ──{NC}")
+if not report["plugins"]:
+    print("  (无)")
+else:
+    for p in report["plugins"]:
+        if p["installed"]:
+            print(f"  {G}✓{NC} {p['name']}  (from {p['repo']})")
+            ok += 1
+        else:
+            print(f"  {R}✗{NC} {p['name']}  — 来源: {p['repo']}")
+            missing.append({"type": "plugin", "name": p["name"], "repo": p["repo"]})
 
-  $has_plugins || echo "  (无插件)"
+# ---- 4. Skill 依赖 ----
+if report["skill_deps"]:
+    print(f"\n{BOLD}── Skill 依赖文件 ──{NC}")
+    for sd in report["skill_deps"]:
+        print(f"  {Y}○{NC} {sd['skill']}/  → {sd['type']} ({os.path.basename(sd['file'])})")
 
-  # ---- 4. 自定义依赖 ----
-  if [ -f "$SYNC_DIR/postinstall.sh" ]; then
-    echo ""
-    echo -e "${BOLD}── 自定义脚本 ──${NC}"
-    echo "  postinstall.sh 存在"
-  fi
+# ---- 5. 自定义脚本 ----
+if report["postinstall"]:
+    print(f"\n{BOLD}── 自定义脚本 ──{NC}")
+    print(f"  {G}✓{NC} postinstall.sh")
 
-  # ---- 汇总 ----
-  echo ""
-  echo "────────────────────────────────────"
-  if [ "$missing" -gt 0 ]; then
-    echo -e "  ${GREEN}$ok_count 项就绪${NC} / ${RED}$missing 项缺失${NC}"
-    if [ "$mode" = "check" ]; then
+# ---- 汇总 ----
+print(f"\n{'─' * 36}")
+if missing:
+    print(f"  {G}{ok} 项就绪{NC} / {R}{len(missing)} 项缺失{NC}")
+    if mode == "check":
+        print(f"\n  运行 {BOLD}/sync deps install{NC} 自动安装缺失项")
+else:
+    print(f"  {G}全部 {ok} 项就绪！{NC}")
+print()
+
+# ---- 生成安装脚本（install 模式）----
+if mode == "install" and missing:
+    install_script = os.path.join(sync_dir, ".deps-install.sh")
+    with open(install_script, "w") as f:
+        f.write("#!/usr/bin/env bash\nset -euo pipefail\n\n")
+
+        for item in missing:
+            if item["type"] == "command":
+                cmd = item["name"]
+                f.write(f'echo ">>> 安装 {cmd}..."\n')
+                # 尝试智能匹配安装方式
+                f.write(f'if command -v brew &>/dev/null && brew info {cmd} &>/dev/null 2>&1; then\n')
+                f.write(f'  brew install {cmd}\n')
+                f.write(f'else\n')
+                f.write(f'  echo "[需要手动安装] {cmd} — 被 {item["source"]} 引用"\n')
+                f.write(f'fi\n\n')
+
+            elif item["type"] == "plugin":
+                f.write(f'echo ">>> 安装插件 {item["name"]}..."\n')
+                f.write(f'if command -v claude &>/dev/null; then\n')
+                f.write(f'  claude plugin add {item["repo"]}\n')
+                f.write(f'else\n')
+                f.write(f'  echo "[需要 claude CLI] claude plugin add {item["repo"]}"\n')
+                f.write(f'fi\n\n')
+
+            elif item["type"] == "mcp":
+                if item["pkg_type"] == "npm":
+                    f.write(f'echo ">>> 预缓存 MCP: {item["package"]}..."\n')
+                    f.write(f'npx -y {item["package"]} --help > /dev/null 2>&1 || true\n\n')
+                elif item["pkg_type"] == "pypi":
+                    f.write(f'echo ">>> 安装 MCP: {item["package"]}..."\n')
+                    f.write(f'pip install {item["package"]} 2>/dev/null || pip3 install {item["package"]}\n\n')
+
+        # postinstall
+        postinstall = os.path.join(sync_dir, "postinstall.sh")
+        if os.path.isfile(postinstall):
+            f.write(f'echo ">>> 运行自定义脚本..."\n')
+            f.write(f'bash "{postinstall}"\n\n')
+
+        # skill deps
+        for sd in report.get("skill_deps", []):
+            if sd["type"] == "pip":
+                f.write(f'echo ">>> 安装 {sd["skill"]} 的 Python 依赖..."\n')
+                f.write(f'pip install -r "{sd["file"]}" 2>/dev/null || pip3 install -r "{sd["file"]}"\n\n')
+            elif sd["type"] == "npm":
+                f.write(f'echo ">>> 安装 {sd["skill"]} 的 npm 依赖..."\n')
+                f.write(f'cd "$(dirname "{sd["file"]}")" && npm install\n\n')
+
+    print(f"  {BOLD}生成安装脚本:{NC} {install_script}")
+    # 输出标记让 bash 知道可以执行
+    print(f"__INSTALL_SCRIPT__:{install_script}")
+
+PYTHON_RENDER
+
+  # 如果是 install 模式，执行生成的安装脚本
+  if [ "$mode" = "install" ]; then
+    local install_script="$SYNC_DIR/.deps-install.sh"
+    if [ -f "$install_script" ]; then
       echo ""
-      echo -e "  运行 ${BOLD}/sync deps install${NC} 自动安装缺失项"
+      log_info "开始安装..."
+      echo ""
+      bash "$install_script"
+      rm -f "$install_script"
+      echo ""
+      log_ok "安装完成！重新检查环境："
+      echo ""
+      # 重新扫描验证
+      cmd_deps check
     fi
-  else
-    echo -e "  ${GREEN}全部 $ok_count 项就绪！${NC}"
-  fi
-  echo ""
-
-  # ---- 自动安装模式 ----
-  if [ "$mode" = "install" ] && [ "$missing" -gt 0 ]; then
-    echo -e "${BOLD}开始安装缺失依赖...${NC}"
-    echo ""
-
-    # 系统工具
-    for tool in "${tools_to_install[@]}"; do
-      case "$tool" in
-        node|npx)
-          log_step "安装 Node.js..."
-          if command -v brew &>/dev/null; then
-            brew install node 2>&1 | tail -3
-            log_ok "Node.js 已安装"
-          else
-            log_warn "未找到 Homebrew，请手动安装: brew install node"
-          fi
-          ;;
-        bun)
-          log_step "安装 Bun..."
-          curl -fsSL https://bun.sh/install | bash 2>&1 | tail -3
-          log_ok "Bun 已安装"
-          ;;
-        claude)
-          log_step "安装 Claude CLI..."
-          if command -v npm &>/dev/null; then
-            npm install -g @anthropic-ai/claude-code 2>&1 | tail -3
-            log_ok "Claude CLI 已安装"
-          else
-            log_warn "需要先安装 Node.js"
-          fi
-          ;;
-        git|python3|rsync)
-          log_step "安装 $tool..."
-          if command -v brew &>/dev/null; then
-            brew install "$tool" 2>&1 | tail -3
-            log_ok "$tool 已安装"
-          else
-            log_warn "请手动安装 $tool"
-          fi
-          ;;
-      esac
-    done
-
-    # 插件
-    for entry in "${plugins_to_install[@]}"; do
-      local name="${entry%%|*}"
-      local repo="${entry#*|}"
-      log_step "安装插件 $name..."
-      if command -v claude &>/dev/null; then
-        claude plugin add "$repo" 2>&1 | tail -5
-        log_ok "插件 $name 已安装"
-      else
-        log_warn "Claude CLI 不可用，请手动安装: claude plugin add $repo"
-      fi
-    done
-
-    # 自定义脚本
-    if [ -f "$SYNC_DIR/postinstall.sh" ]; then
-      log_step "运行自定义安装脚本..."
-      bash "$SYNC_DIR/postinstall.sh"
-      log_ok "自定义脚本执行完成"
-    fi
-
-    echo ""
-    log_ok "依赖安装完成！"
-    echo ""
   fi
 }
 
